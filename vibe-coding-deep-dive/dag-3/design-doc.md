@@ -45,7 +45,7 @@ Tot slot is er gekozen voor een duidelijke scheiding tussen spelstatus in de fro
 
 ---
 
-## 4. Bekende risicoâ€™s: Overzicht
+## 4. Bekende risico's: Overzicht
 
 **Risico 1: Kwaliteit en betrouwbaarheid van AI-vragen:**
 Een belangrijk risico is de kwaliteit en betrouwbaarheid van AI-gegenereerde vragen. Als ik AI gebruik om vragen te genereren, kan het gebeuren dat er feitelijke fouten of onduidelijke formuleringen in de vragen zitten. Dit kan de spelervaring minder betrouwbaar maken. Om dit te beperken kan ik starten met een handmatig gecontroleerde set vragen of een beperkte hoeveelheid AI-content gebruiken die ik eerst zelf check.
