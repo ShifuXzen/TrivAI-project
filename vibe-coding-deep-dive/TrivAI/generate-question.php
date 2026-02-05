@@ -2,6 +2,7 @@
 header("Content-Type: application/json; charset=utf-8");
 
 $config = require __DIR__ . DIRECTORY_SEPARATOR . "config.php";
+require_once __DIR__ . DIRECTORY_SEPARATOR . "ai_helpers.php";
 
 function respond(int $status, array $payload): void
 {
@@ -270,91 +271,27 @@ $query = str_replace(
   $template
 );
 $startMax = max(0, (int) ($config["serp_start_max"] ?? 0));
-$start = 0;
-if ($startMax > 0) {
-  $start = random_int(0, $startMax);
-}
-$params = http_build_query([
-  "engine" => $config["serp_engine"],
-  "q" => $query,
-  "api_key" => $config["serp_api_key"],
-  "hl" => $config["serp_hl"],
-  "gl" => $config["serp_gl"],
-  "num" => $config["serp_num"],
-  "google_domain" => $config["serp_google_domain"],
-  "start" => $start,
-  "output" => "json",
-]);
-
-$ch = curl_init($config["serp_endpoint"] . "?" . $params);
-curl_setopt($ch, CURLOPT_HTTPHEADER, [
-  "Accept: application/json",
-]);
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-curl_setopt($ch, CURLOPT_ENCODING, "");
-
-$serpRaw = curl_exec($ch);
-$serpStatus = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-$serpError = curl_error($ch);
-curl_close($ch);
-
-if ($serpRaw === false || $serpStatus < 200 || $serpStatus >= 300) {
-  if ($serpStatus === 429) {
+$serpDebug = [];
+try {
+  $sources = ai_fetch_serp_sources(
+    $config,
+    $query,
+    $startMax,
+    5,
+    $debug ? $serpDebug : null
+  );
+} catch (RuntimeException $e) {
+  error_log("SerpAPI error: " . $e->getMessage());
+  if ($e->getCode() === 429) {
     respond(429, ["error" => "SerpAPI rate limit reached"]);
   }
-  $payload = ["error" => "SerpAPI request failed"];
+  $payload = ["error" => $e->getMessage()];
   if ($debug) {
-    $payload["serp_status"] = $serpStatus;
-    $payload["serp_error"] = $serpError;
-    $payload["serp_body"] = $serpRaw ? mb_substr($serpRaw, 0, 2000) : "";
+    $payload["serp_status"] = $serpDebug["status"] ?? null;
+    $payload["serp_error"] = $serpDebug["error"] ?? null;
+    $payload["serp_body"] = $serpDebug["body"] ?? "";
   }
   respond(502, $payload);
-}
-
-$serpData = json_decode($serpRaw, true);
-if (isset($serpData["error"])) {
-  $payload = ["error" => "SerpAPI error: " . $serpData["error"]];
-  if ($debug) {
-    $payload["serp_body"] = mb_substr($serpRaw, 0, 2000);
-  }
-  respond(502, $payload);
-}
-
-$status = $serpData["search_metadata"]["status"] ?? "";
-if ($status !== "" && $status !== "Success") {
-  $payload = ["error" => "SerpAPI status: " . $status];
-  if ($debug) {
-    $payload["serp_body"] = mb_substr($serpRaw, 0, 2000);
-  }
-  respond(502, $payload);
-}
-
-$results = $serpData["organic_results"] ?? [];
-if (!is_array($results) || count($results) === 0) {
-  respond(502, ["error" => "No results from SerpAPI"]);
-}
-
-$sources = [];
-foreach ($results as $item) {
-  if (count($sources) >= 5) {
-    break;
-  }
-  $title = $item["title"] ?? "";
-  $url = $item["link"] ?? "";
-  $snippet = $item["snippet"] ?? "";
-  if ($title === "" && $snippet === "") {
-    continue;
-  }
-  $sources[] = [
-    "title" => $title,
-    "url" => $url,
-    "snippet" => $snippet,
-  ];
-}
-
-if (count($sources) === 0) {
-  respond(502, ["error" => "No usable sources"]);
 }
 
 $contextLines = array_map(function ($source) {
@@ -389,69 +326,27 @@ $userPrompt = "Gebruik alleen de bronnen hieronder. Maak 1 trivia-vraag in het N
   . "Bronnen:\n"
   . implode("\n", $contextLines);
 
-$llmPayload = [
-  "model" => $config["groq_model"],
-  "messages" => [
-    ["role" => "system", "content" => $systemPrompt],
-    ["role" => "user", "content" => $userPrompt],
-  ],
-  "temperature" => 0.7,
-  "max_tokens" => 400,
-];
-
-$groqUrl = rtrim($config["groq_endpoint"], "/") . "/chat/completions";
-$groqHeaders = [
-  "Content-Type: application/json",
-  "Accept: application/json",
-  "Authorization: Bearer " . $config["groq_api_key"],
-];
-
-$groqCh = curl_init($groqUrl);
-curl_setopt($groqCh, CURLOPT_HTTPHEADER, $groqHeaders);
-curl_setopt($groqCh, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($groqCh, CURLOPT_TIMEOUT, $config["groq_timeout"]);
-curl_setopt($groqCh, CURLOPT_POST, true);
-curl_setopt($groqCh, CURLOPT_POSTFIELDS, json_encode($llmPayload));
-
-$groqRaw = curl_exec($groqCh);
-$groqStatus = curl_getinfo($groqCh, CURLINFO_HTTP_CODE);
-$groqError = curl_error($groqCh);
-curl_close($groqCh);
-
-if ($groqRaw === false || $groqStatus < 200 || $groqStatus >= 300) {
-  if ($groqStatus === 429) {
+$groqDebug = [];
+try {
+  $questionData = ai_groq_generate_json(
+    $config,
+    $systemPrompt,
+    $userPrompt,
+    0.7,
+    400,
+    $debug ? $groqDebug : null
+  );
+} catch (RuntimeException $e) {
+  error_log("Groq error: " . $e->getMessage());
+  if ($e->getCode() === 429) {
     respond(429, ["error" => "Groq rate limit reached"]);
   }
-  $payload = ["error" => "Groq request failed"];
+  $payload = ["error" => $e->getMessage()];
   if ($debug) {
-    $payload["groq_status"] = $groqStatus;
-    $payload["groq_error"] = $groqError;
-    $payload["groq_body"] = $groqRaw ? mb_substr($groqRaw, 0, 2000) : "";
-  }
-  respond(502, $payload);
-}
-
-$groqData = json_decode($groqRaw, true);
-$content = $groqData["choices"][0]["message"]["content"] ?? "";
-if ($content === "") {
-  $payload = ["error" => "Groq response missing content"];
-  if ($debug) {
-    $payload["groq_body"] = mb_substr($groqRaw, 0, 2000);
-  }
-  respond(502, $payload);
-}
-
-$cleanContent = trim($content);
-if (preg_match("/```(?:json)?\\s*(\\{.*\\}|\\[.*\\])\\s*```/s", $cleanContent, $match)) {
-  $cleanContent = $match[1];
-}
-
-$questionData = json_decode($cleanContent, true);
-if (!is_array($questionData)) {
-  $payload = ["error" => "Groq output was not valid JSON"];
-  if ($debug) {
-    $payload["groq_body"] = mb_substr($groqRaw, 0, 2000);
-    $payload["groq_text"] = mb_substr($cleanContent, 0, 2000);
+    $payload["groq_status"] = $groqDebug["status"] ?? null;
+    $payload["groq_error"] = $groqDebug["error"] ?? null;
+    $payload["groq_body"] = $groqDebug["body"] ?? "";
+    $payload["groq_text"] = $groqDebug["text"] ?? "";
   }
   respond(502, $payload);
 }

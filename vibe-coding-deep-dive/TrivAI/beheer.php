@@ -2,7 +2,10 @@
 
 set_time_limit(30);
 
+session_start();
+
 require_once __DIR__ . DIRECTORY_SEPARATOR . "db.php";
+require_once __DIR__ . DIRECTORY_SEPARATOR . "ai_helpers.php";
 $config = require __DIR__ . DIRECTORY_SEPARATOR . "config.php";
 
 function h(string $value): string
@@ -17,15 +20,6 @@ function decodeJsonArray(?string $value): array
   }
   $decoded = json_decode($value, true);
   return is_array($decoded) ? $decoded : [];
-}
-
-function normalizeText(string $text): string
-{
-  $trimmed = trim($text);
-  if (function_exists("mb_strtolower")) {
-    return mb_strtolower($trimmed);
-  }
-  return strtolower($trimmed);
 }
 
 function buildReworkQuery(array $report): string
@@ -67,88 +61,6 @@ function buildReworkQuery(array $report): string
   );
 }
 
-function fetchSerpSources(array $config, string $query): array
-{
-  $startMax = max(0, (int) ($config["serp_start_max"] ?? 0));
-  $start = 0;
-  if ($startMax > 0) {
-    $start = random_int(0, $startMax);
-  }
-
-  $params = http_build_query([
-    "engine" => $config["serp_engine"] ?? "google",
-    "q" => $query,
-    "api_key" => $config["serp_api_key"] ?? "",
-    "hl" => $config["serp_hl"] ?? "nl",
-    "gl" => $config["serp_gl"] ?? "nl",
-    "num" => (int) ($config["serp_num"] ?? 6),
-    "google_domain" => $config["serp_google_domain"] ?? "google.nl",
-    "start" => $start,
-    "output" => "json",
-  ]);
-
-  $url = rtrim($config["serp_endpoint"] ?? "https://serpapi.com/search.json", "?") . "?" . $params;
-  $ch = curl_init($url);
-  curl_setopt($ch, CURLOPT_HTTPHEADER, ["Accept: application/json"]);
-  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-  curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-  curl_setopt($ch, CURLOPT_ENCODING, "");
-
-  $raw = curl_exec($ch);
-  $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-  $error = curl_error($ch);
-  curl_close($ch);
-
-  if ($raw === false || $status < 200 || $status >= 300) {
-    if ($status === 429) {
-      throw new RuntimeException("SerpAPI rate limit bereikt.");
-    }
-    throw new RuntimeException("SerpAPI request failed: " . ($error ?: "HTTP " . $status));
-  }
-
-  $data = json_decode($raw, true);
-  if (!is_array($data)) {
-    throw new RuntimeException("SerpAPI response is onleesbaar.");
-  }
-  if (isset($data["error"])) {
-    throw new RuntimeException("SerpAPI error: " . $data["error"]);
-  }
-
-  $statusValue = $data["search_metadata"]["status"] ?? "";
-  if ($statusValue !== "" && $statusValue !== "Success") {
-    throw new RuntimeException("SerpAPI status: " . $statusValue);
-  }
-
-  $results = $data["organic_results"] ?? [];
-  if (!is_array($results) || count($results) === 0) {
-    throw new RuntimeException("Geen bronnen gevonden via SerpAPI.");
-  }
-
-  $sources = [];
-  foreach ($results as $item) {
-    if (count($sources) >= 5) {
-      break;
-    }
-    $title = $item["title"] ?? "";
-    $urlValue = $item["link"] ?? "";
-    $snippet = $item["snippet"] ?? "";
-    if ($title === "" && $snippet === "") {
-      continue;
-    }
-    $sources[] = [
-      "title" => $title,
-      "url" => $urlValue,
-      "snippet" => $snippet,
-    ];
-  }
-
-  if (count($sources) === 0) {
-    throw new RuntimeException("Geen bruikbare bronnen gevonden.");
-  }
-
-  return $sources;
-}
-
 function callGroqRework(array $config, array $report, array $sources): array
 {
   $category = $report["category"] ?? "Algemeen";
@@ -188,58 +100,13 @@ function callGroqRework(array $config, array $report, array $sources): array
     $userPrompt .= "Oorspronkelijke correctIndex: {$correctIndex}\n";
   }
   $userPrompt .= "\nBronnen:\n" . implode("\n", $contextLines);
-
-  $payload = [
-    "model" => $config["groq_model"] ?? "",
-    "messages" => [
-      ["role" => "system", "content" => $systemPrompt],
-      ["role" => "user", "content" => $userPrompt],
-    ],
-    "temperature" => 0.5,
-    "max_tokens" => 450,
-  ];
-
-  $groqUrl = rtrim($config["groq_endpoint"] ?? "https://api.groq.com/openai/v1", "/") . "/chat/completions";
-  $headers = [
-    "Content-Type: application/json",
-    "Accept: application/json",
-    "Authorization: Bearer " . ($config["groq_api_key"] ?? ""),
-  ];
-
-  $ch = curl_init($groqUrl);
-  curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-  curl_setopt($ch, CURLOPT_TIMEOUT, (int) ($config["groq_timeout"] ?? 20));
-  curl_setopt($ch, CURLOPT_POST, true);
-  curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-
-  $raw = curl_exec($ch);
-  $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-  $error = curl_error($ch);
-  curl_close($ch);
-
-  if ($raw === false || $status < 200 || $status >= 300) {
-    if ($status === 429) {
-      throw new RuntimeException("Groq rate limit bereikt.");
-    }
-    throw new RuntimeException("Groq request failed: " . ($error ?: "HTTP " . $status));
-  }
-
-  $data = json_decode($raw, true);
-  $content = $data["choices"][0]["message"]["content"] ?? "";
-  if ($content === "") {
-    throw new RuntimeException("Groq response mist content.");
-  }
-
-  $cleanContent = trim($content);
-  if (preg_match("/```(?:json)?\\s*(\\{.*\\}|\\[.*\\])\\s*```/s", $cleanContent, $match)) {
-    $cleanContent = $match[1];
-  }
-
-  $questionData = json_decode($cleanContent, true);
-  if (!is_array($questionData)) {
-    throw new RuntimeException("Groq output was niet valide JSON.");
-  }
+  $questionData = ai_groq_generate_json(
+    $config,
+    $systemPrompt,
+    $userPrompt,
+    0.5,
+    450
+  );
 
   $question = $questionData["question"] ?? "";
   $answersOut = $questionData["answers"] ?? [];
@@ -263,6 +130,136 @@ function callGroqRework(array $config, array $report, array $sources): array
     "correctIndex" => $correctOut,
     "category" => $categoryOut,
   ];
+}
+
+$adminUser = getenv("ADMIN_USER") ?: "admin";
+$adminPassword = getenv("ADMIN_PASSWORD") ?: "";
+$adminPasswordHash = getenv("ADMIN_PASSWORD_HASH") ?: "";
+$loginError = "";
+
+if (isset($_GET["logout"])) {
+  $_SESSION = [];
+  if (ini_get("session.use_cookies")) {
+    $params = session_get_cookie_params();
+    setcookie(session_name(), "", time() - 42000, $params["path"], $params["domain"], $params["secure"], $params["httponly"]);
+  }
+  session_destroy();
+  header("Location: beheer.php");
+  exit;
+}
+
+if (!($_SESSION["admin_authenticated"] ?? false)) {
+  if ($_SERVER["REQUEST_METHOD"] === "POST" && ($_POST["action"] ?? "") === "login") {
+    $username = trim($_POST["username"] ?? "");
+    $password = (string) ($_POST["password"] ?? "");
+    $validUser = $adminUser === "" || hash_equals($adminUser, $username);
+    $validPass = false;
+    if ($adminPasswordHash !== "") {
+      $validPass = password_verify($password, $adminPasswordHash);
+    } elseif ($adminPassword !== "") {
+      $validPass = hash_equals($adminPassword, $password);
+    }
+
+    if ($validUser && $validPass) {
+      $_SESSION["admin_authenticated"] = true;
+      header("Location: beheer.php");
+      exit;
+    }
+
+    $loginError = "Onjuiste inloggegevens.";
+  } elseif ($adminPassword === "" && $adminPasswordHash === "") {
+    $loginError = "ADMIN_PASSWORD ontbreekt in .env.";
+  }
+
+  ?>
+  <!doctype html>
+  <html lang="nl">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>TrivAI - Beheer login</title>
+      <style>
+        :root {
+          color-scheme: light;
+          font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        }
+        body {
+          margin: 0;
+          background: #f5f7fb;
+          color: #1f2937;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          min-height: 100vh;
+          padding: 20px;
+        }
+        .card {
+          background: #fff;
+          padding: 28px;
+          border-radius: 16px;
+          box-shadow: 0 12px 32px rgba(15, 23, 42, 0.12);
+          width: min(420px, 100%);
+        }
+        h1 {
+          margin: 0 0 8px;
+          font-size: 24px;
+        }
+        p {
+          margin: 0 0 16px;
+          color: #6b7280;
+        }
+        label {
+          display: block;
+          font-weight: 600;
+          margin-bottom: 6px;
+        }
+        input {
+          width: 100%;
+          padding: 10px 12px;
+          border-radius: 10px;
+          border: 1px solid #d1d5db;
+          margin-bottom: 14px;
+          font-size: 14px;
+        }
+        button {
+          width: 100%;
+          padding: 10px 16px;
+          border-radius: 999px;
+          border: none;
+          background: #2563eb;
+          color: #fff;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .error {
+          background: #fee2e2;
+          color: #b91c1c;
+          padding: 10px 12px;
+          border-radius: 10px;
+          margin-bottom: 12px;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Beheer login</h1>
+        <p>Log in om AI‑rapporten te beheren.</p>
+        <?php if ($loginError !== ""): ?>
+          <div class="error"><?php echo h($loginError); ?></div>
+        <?php endif; ?>
+        <form method="post">
+          <input type="hidden" name="action" value="login" />
+          <label for="username">Gebruikersnaam</label>
+          <input id="username" name="username" type="text" autocomplete="username" required />
+          <label for="password">Wachtwoord</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required />
+          <button type="submit">Inloggen</button>
+        </form>
+      </div>
+    </body>
+  </html>
+  <?php
+  exit;
 }
 
 $error = null;
@@ -291,10 +288,22 @@ try {
     }
 
     if ($action === "approve") {
+      $stmt = $pdo->prepare(
+        "UPDATE ai_question_reports
+         SET status = 'approved', reviewed_at = NOW()
+         WHERE id = :id"
+      );
+      $stmt->execute([":id" => $id]);
+      header("Location: beheer.php?status=" . urlencode($returnFilter)
+        . "&message=Vraag+goedgekeurd");
+      exit;
+    }
+
+    if ($action === "delete") {
       $stmt = $pdo->prepare("DELETE FROM ai_question_reports WHERE id = :id");
       $stmt->execute([":id" => $id]);
       header("Location: beheer.php?status=" . urlencode($returnFilter)
-        . "&message=Vraag+goedgekeurd+en+verwijderd");
+        . "&message=Rapport+verwijderd");
       exit;
     }
 
@@ -318,9 +327,17 @@ try {
         exit;
       }
 
-      $query = buildReworkQuery($report);
-      $sources = fetchSerpSources($config, $query);
-      $reworked = callGroqRework($config, $report, $sources);
+      try {
+        $query = buildReworkQuery($report);
+        $startMax = max(0, (int) ($config["serp_start_max"] ?? 0));
+        $sources = ai_fetch_serp_sources($config, $query, $startMax, 5);
+        $reworked = callGroqRework($config, $report, $sources);
+      } catch (Throwable $reworkError) {
+        error_log("Rework failed: " . $reworkError->getMessage());
+        header("Location: beheer.php?status=" . urlencode($returnFilter)
+          . "&messageType=error&message=Herstructureren+mislukt");
+        exit;
+      }
 
       $answersJson = json_encode($reworked["answers"], JSON_UNESCAPED_UNICODE);
       if ($answersJson === false) {
@@ -375,6 +392,7 @@ try {
   $reports = $stmt->fetchAll();
 } catch (Throwable $e) {
   $error = $e->getMessage();
+  error_log("Beheer error: " . $e->getMessage());
   $reports = [];
 }
 
@@ -407,6 +425,11 @@ try {
         gap: 12px;
         margin-bottom: 18px;
       }
+      .header-actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
       h1 {
         font-size: 28px;
         margin: 0;
@@ -418,6 +441,9 @@ try {
         padding: 10px 16px;
         border-radius: 999px;
         font-weight: 600;
+      }
+      a.logout {
+        background: #6b7280;
       }
       .filters {
         display: flex;
@@ -567,7 +593,10 @@ try {
     <div class="page">
       <header>
         <h1>AI vraagrapporten</h1>
-        <a class="back" href="index.php">Terug naar spel</a>
+        <div class="header-actions">
+          <a class="back" href="index.php">Terug naar spel</a>
+          <a class="back logout" href="beheer.php?logout=1">Uitloggen</a>
+        </div>
       </header>
 
       <div class="filters">
@@ -735,6 +764,12 @@ try {
                           <input type="hidden" name="return_status" value="<?php echo h($filter); ?>" />
                           <button class="btn approve" type="submit" name="action" value="approve">Goedkeuren</button>
                           <button class="btn rework" type="submit" name="action" value="rework">Herstructureren</button>
+                        </form>
+                      <?php elseif ($statusValue === "approved"): ?>
+                        <form method="post" class="actions">
+                          <input type="hidden" name="id" value="<?php echo h((string) $report["id"]); ?>" />
+                          <input type="hidden" name="return_status" value="<?php echo h($filter); ?>" />
+                          <button class="btn rework" type="submit" name="action" value="delete">Verwijderen</button>
                         </form>
                       <?php else: ?>
                         -

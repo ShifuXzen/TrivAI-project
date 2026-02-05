@@ -18,9 +18,15 @@
       </header>
       <p class="subtitle">Kies het juiste antwoord</p>
 
-      <div class="status" aria-live="polite">
-        <span class="status-label">Levens</span>
-        <span id="lives" class="lives">3</span>
+      <div class="status-bar" aria-live="polite">
+        <div class="status">
+          <span class="status-label">Levens</span>
+          <span id="lives" class="lives">3</span>
+        </div>
+        <div class="status">
+          <span class="status-label">Score</span>
+          <span id="score" class="score">0</span>
+        </div>
       </div>
 
       <section class="card search-card" aria-labelledby="vraag-titel">

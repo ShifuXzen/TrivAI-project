@@ -2,6 +2,7 @@ const questionEl = document.getElementById("question");
 const answersEl = document.getElementById("answers");
 const feedbackEl = document.getElementById("feedback");
 const livesEl = document.getElementById("lives");
+const scoreEl = document.getElementById("score");
 const gameOverEl = document.getElementById("game-over");
 const retryBtn = document.getElementById("retry");
 const reportBtn = document.getElementById("report");
@@ -16,6 +17,7 @@ const liveQuestionEndpoint = "generate-question.php";
 
 const startingLives = 3;
 let lives = startingLives;
+let score = 0;
 let lastCategory = null;
 let lastQuestionIndex = null;
 let currentQuestion = null;
@@ -310,6 +312,9 @@ function renderQuestion(data) {
         if (lives === 0) {
           showGameOver();
         }
+      } else {
+        score += 1;
+        renderScore();
       }
 
       if (lives > 0) {
@@ -534,6 +539,10 @@ function renderLives() {
   livesEl.textContent = lives;
 }
 
+function renderScore() {
+  scoreEl.textContent = score;
+}
+
 function showGameOver() {
   if (lives === 0) {
     gameOverEl.hidden = false;
@@ -589,6 +598,8 @@ async function reportQuestion() {
 retryBtn.addEventListener("click", () => {
   lives = startingLives;
   renderLives();
+  score = 0;
+  renderScore();
   lastCategory = null;
   lastQuestionIndex = null;
   answeredQuestions.clear();
@@ -602,4 +613,5 @@ retryBtn.addEventListener("click", () => {
 reportBtn.addEventListener("click", reportQuestion);
 
 renderLives();
+renderScore();
 loadNextQuestion();

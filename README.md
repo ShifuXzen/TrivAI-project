@@ -84,6 +84,15 @@ DB_USER=root
 DB_PASS=your_password
 DB_CHARSET=utf8mb4
 
+# Beheer
+ADMIN_USER=admin
+ADMIN_PASSWORD=your_admin_password
+# Optioneel: ADMIN_PASSWORD_HASH (gebruik password_hash in PHP)
+
+# Reports
+REPORT_RATE_LIMIT=5
+REPORT_RATE_WINDOW=60
+
 # Cache
 CACHE_TTL=900
 CACHE_MAX=50
@@ -102,3 +111,4 @@ php -S localhost:8000 -t TrivAI-project/vibe-coding-deep-dive/TrivAI
 1. `Groq request failed` of `SerpAPI rate limit` betekent dat je API‑quota op is.
 2. `Unknown column 'status'` betekent dat je de DB‑kolommen nog niet hebt toegevoegd.
 3. `Database configuratie ontbreekt` betekent dat `.env` nog geen `DB_*` velden bevat.
+4. `Beheer login` blijft terugkomen betekent dat `ADMIN_PASSWORD` ontbreekt of onjuist is.

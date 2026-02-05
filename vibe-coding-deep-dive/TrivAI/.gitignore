@@ -1,3 +1,4 @@
 .env
 reports.json
 question-cache.json
+report-rate.json
