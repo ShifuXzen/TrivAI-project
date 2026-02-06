@@ -34,7 +34,7 @@ const questions = [
   {
     id: "ai-001",
     category: "Aardrijkskunde",
-    question: "Wat is de hoofdstad van Itali\u00eb?",
+    question: "Wat is de hoofdstad van Italië?",
     answers: ["Rome", "Milaan", "Florence", "Napels"],
     correctIndex: 0,
   },
@@ -235,6 +235,7 @@ async function loadNextQuestion() {
 
 function renderQuestion(data) {
   currentQuestion = data;
+  markAnsweredQuestion(data.question, data.category);
   questionEl.textContent = data.question;
   answersEl.innerHTML = "";
   feedbackEl.textContent = "";
@@ -325,8 +326,6 @@ function renderQuestion(data) {
           loadNextQuestion();
         }, 1200);
       }
-
-      markAnsweredQuestion(data.question, data.category);
       btn.classList.add(isCorrect ? "answer--good" : "answer--bad");
       answersEl.querySelectorAll("button").forEach((button) => {
         button.disabled = true;
@@ -490,7 +489,14 @@ async function fetchLiveQuestion(
 }
 
 function normalizeQuestion(text) {
-  return text.trim().toLowerCase();
+  return text
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function isDuplicateQuestion(text) {

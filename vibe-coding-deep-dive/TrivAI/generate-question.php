@@ -23,11 +23,33 @@ function safeSubstr(string $text, int $length): string
 function normalizeText(string $text): string
 {
   $trimmed = trim($text);
-  if (function_exists("mb_strtolower")) {
-    return mb_strtolower($trimmed);
+  $lowered = function_exists("mb_strtolower")
+    ? mb_strtolower($trimmed)
+    : strtolower($trimmed);
+
+  $normalized = $lowered;
+  if (class_exists("Normalizer")) {
+    $form = Normalizer::normalize($normalized, Normalizer::FORM_D);
+    if ($form !== false && $form !== null) {
+      $normalized = $form;
+    }
   }
 
-  return strtolower($trimmed);
+  $withoutMarks = preg_replace("/\\p{Mn}+/u", "", $normalized);
+  if ($withoutMarks !== null) {
+    $normalized = $withoutMarks;
+  }
+
+  if (function_exists("iconv")) {
+    $translit = iconv("UTF-8", "ASCII//TRANSLIT//IGNORE", $normalized);
+    if ($translit !== false && $translit !== null) {
+      $normalized = $translit;
+    }
+  }
+
+  $normalized = preg_replace("/[^\\p{L}\\p{N}\\s]+/u", " ", $normalized) ?? $normalized;
+  $normalized = preg_replace("/\\s+/u", " ", $normalized) ?? $normalized;
+  return trim($normalized);
 }
 
 function parseList(string $value, string $delimiter = ","): array
@@ -49,19 +71,83 @@ function normalizeList(array $items): array
   return array_values(array_unique($out));
 }
 
-if ($_SERVER["REQUEST_METHOD"] !== "GET") {
+function isQuestionExcluded(string $question, array $excludedQuestions): bool
+{
+  if ($question === "" || count($excludedQuestions) === 0) {
+    return false;
+  }
+
+  return in_array(normalizeText($question), $excludedQuestions, true);
+}
+
+function buildUserPrompt(
+  string $category,
+  string $excludeQuestion,
+  array $excludedQuestions,
+  array $excludedCategories,
+  array $contextLines
+): string {
+  $prompt = "Gebruik alleen de bronnen hieronder. Maak 1 trivia-vraag in het Nederlands.\n"
+    . "Regels:\n"
+    . "- Exact 4 antwoordopties\n"
+    . "- Exact 1 correct antwoord\n"
+    . "- correctIndex is 0-3\n"
+    . "- category: {$category}\n";
+
+  if ($excludeQuestion !== "") {
+    $prompt .= "- Vermijd exact deze vraag: \"{$excludeQuestion}\"\n";
+  }
+  if (count($excludedQuestions) > 0) {
+    $prompt .= "- Vermijd exact deze vragen: \"" . implode("\" | \"", $excludedQuestions) . "\"\n";
+  }
+  if (count($excludedCategories) > 0) {
+    $prompt .= "- Vermijd deze categorieen: " . implode(", ", $excludedCategories) . "\n";
+  }
+
+  $prompt .= "Geef JSON met velden: question, answers, correctIndex, category.\n\n"
+    . "Bronnen:\n"
+    . implode("\n", $contextLines);
+
+  return $prompt;
+}
+
+$requestMethod = $_SERVER["REQUEST_METHOD"] ?? "";
+if ($requestMethod === "") {
+  $requestMethod = "CLI";
+}
+
+if (!in_array($requestMethod, ["GET", "POST", "CLI"], true)) {
   respond(405, ["error" => "Method not allowed"]);
 }
 
-$debug = isset($_GET["debug"]) && $_GET["debug"] === "1";
-$excludeId = isset($_GET["excludeId"]) ? trim($_GET["excludeId"]) : "";
-$excludeQuestion = isset($_GET["excludeQuestion"]) ? trim($_GET["excludeQuestion"]) : "";
+$request = $_GET;
+if ($requestMethod === "POST") {
+  $postData = $_POST;
+  $contentType = $_SERVER["CONTENT_TYPE"] ?? "";
+  if ($contentType !== "" && stripos($contentType, "application/json") !== false) {
+    $rawBody = file_get_contents("php://input");
+    if ($rawBody !== false && $rawBody !== "") {
+      $decoded = json_decode($rawBody, true);
+      if (is_array($decoded)) {
+        $postData = array_merge($postData, $decoded);
+      }
+    }
+  }
+  $request = array_merge($request, $postData);
+}
+
+$debug = isset($request["debug"]) && $request["debug"] === "1";
+$excludeId = isset($request["excludeId"]) ? trim($request["excludeId"]) : "";
+$excludeQuestion = isset($request["excludeQuestion"]) ? trim($request["excludeQuestion"]) : "";
 $excludeQuestion = $excludeQuestion !== "" ? safeSubstr($excludeQuestion, 200) : "";
-$excludeCategoriesParam = isset($_GET["excludeCategories"]) ? trim($_GET["excludeCategories"]) : "";
-$excludeQuestionsParam = isset($_GET["excludeQuestions"]) ? trim($_GET["excludeQuestions"]) : "";
+$excludeCategoriesParam = isset($request["excludeCategories"]) ? trim($request["excludeCategories"]) : "";
+$excludeQuestionsParam = isset($request["excludeQuestions"]) ? trim($request["excludeQuestions"]) : "";
 $cachePath = __DIR__ . DIRECTORY_SEPARATOR . "question-cache.json";
 $cacheTtl = max(0, (int) ($config["cache_ttl"] ?? 900));
 $cacheMax = max(0, (int) ($config["cache_max"] ?? 50));
+$historyPath = __DIR__ . DIRECTORY_SEPARATOR . "question-history.json";
+$historyTtl = (int) ($config["history_ttl"] ?? 0);
+$historyMax = max(0, (int) ($config["history_max"] ?? 500));
 
 function loadQuestionCache(string $path): array
 {
@@ -113,6 +199,56 @@ function saveQuestionCache(string $path, array $items): void
   );
 }
 
+function loadQuestionHistory(string $path): array
+{
+  if (!file_exists($path)) {
+    return [];
+  }
+
+  $raw = file_get_contents($path);
+  if ($raw === false || $raw === "") {
+    return [];
+  }
+
+  $data = json_decode($raw, true);
+  if (!is_array($data)) {
+    return [];
+  }
+
+  return $data;
+}
+
+function pruneQuestionHistory(array $items, int $ttlSeconds): array
+{
+  if ($ttlSeconds <= 0) {
+    return $items;
+  }
+
+  $now = time();
+  $filtered = [];
+  foreach ($items as $item) {
+    $cachedAt = $item["cachedAt"] ?? null;
+    $timestamp = $cachedAt ? strtotime($cachedAt) : false;
+    if ($timestamp === false) {
+      continue;
+    }
+    if (($now - $timestamp) <= $ttlSeconds) {
+      $filtered[] = $item;
+    }
+  }
+
+  return $filtered;
+}
+
+function saveQuestionHistory(string $path, array $items): void
+{
+  file_put_contents(
+    $path,
+    json_encode(array_values($items), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE),
+    LOCK_EX
+  );
+}
+
 $missing = [];
 $required = [
   "serp_api_key" => "SERP_API_KEY",
@@ -143,8 +279,8 @@ $categories = [
   "Literatuur" => "literatuur feiten",
 ];
 
-$excludeCategory = isset($_GET["excludeCategory"]) ? trim($_GET["excludeCategory"]) : "";
-$requestedCategory = isset($_GET["category"]) ? trim($_GET["category"]) : "";
+$excludeCategory = isset($request["excludeCategory"]) ? trim($request["excludeCategory"]) : "";
+$requestedCategory = isset($request["category"]) ? trim($request["category"]) : "";
 
 $excludedCategories = normalizeList(parseList($excludeCategoriesParam, ","));
 if ($excludeCategory !== "") {
@@ -152,17 +288,33 @@ if ($excludeCategory !== "") {
   $excludedCategories = array_values(array_unique($excludedCategories));
 }
 
+$excludedQuestionsRaw = [];
 $excludedQuestions = [];
 if ($excludeQuestion !== "") {
+  $excludedQuestionsRaw[] = $excludeQuestion;
   $excludedQuestions[] = normalizeText($excludeQuestion);
 }
 if ($excludeQuestionsParam !== "") {
   $more = parseList($excludeQuestionsParam, "|");
   foreach ($more as $item) {
+    $excludedQuestionsRaw[] = $item;
     $excludedQuestions[] = normalizeText($item);
   }
 }
+$excludedQuestionsRaw = array_values(array_unique($excludedQuestionsRaw));
 $excludedQuestions = array_values(array_unique($excludedQuestions));
+
+$historyItems = pruneQuestionHistory(loadQuestionHistory($historyPath), $historyTtl);
+$historyQuestions = [];
+foreach ($historyItems as $item) {
+  $historyQuestion = $item["question"] ?? "";
+  if ($historyQuestion === "") {
+    continue;
+  }
+  $historyQuestions[] = normalizeText($historyQuestion);
+}
+$historyQuestions = array_values(array_unique($historyQuestions));
+$excludedQuestionsCombined = array_values(array_unique(array_merge($excludedQuestions, $historyQuestions)));
 
 $cacheItems = pruneQuestionCache(loadQuestionCache($cachePath), $cacheTtl);
 
@@ -227,9 +379,9 @@ foreach ($cacheItems as $index => $item) {
       continue;
     }
   }
-  if (count($excludedQuestions) > 0) {
+  if (count($excludedQuestionsCombined) > 0) {
     $itemQuestion = $item["question"] ?? "";
-    if ($itemQuestion !== "" && in_array(normalizeText($itemQuestion), $excludedQuestions, true)) {
+    if ($itemQuestion !== "" && in_array(normalizeText($itemQuestion), $excludedQuestionsCombined, true)) {
       continue;
     }
   }
@@ -249,6 +401,17 @@ if ($cacheHitIndex !== null) {
   saveQuestionCache($cachePath, $cacheItems);
   unset($cached["cachedAt"]);
   $cached["origin"] = "cache";
+  if ($historyMax > 0) {
+    $historyItems[] = [
+      "question" => $cached["question"] ?? "",
+      "category" => $cached["category"] ?? "",
+      "cachedAt" => date("c"),
+    ];
+    if (count($historyItems) > $historyMax) {
+      $historyItems = array_slice($historyItems, -$historyMax);
+    }
+    saveQuestionHistory($historyPath, $historyItems);
+  }
   respond(200, $cached);
 }
 
@@ -271,14 +434,14 @@ $query = str_replace(
   $template
 );
 $startMax = max(0, (int) ($config["serp_start_max"] ?? 0));
-$serpDebug = [];
+$serpDebug = $debug ? [] : null;
 try {
   $sources = ai_fetch_serp_sources(
     $config,
     $query,
     $startMax,
     5,
-    $debug ? $serpDebug : null
+    $serpDebug
   );
 } catch (RuntimeException $e) {
   error_log("SerpAPI error: " . $e->getMessage());
@@ -309,62 +472,94 @@ $contextLines = array_map(function ($source) {
 }, $sources);
 
 $systemPrompt = "You generate Dutch trivia questions. Output ONLY valid JSON.";
-$userPrompt = "Gebruik alleen de bronnen hieronder. Maak 1 trivia-vraag in het Nederlands.\n"
-  . "Regels:\n"
-  . "- Exact 4 antwoordopties\n"
-  . "- Exact 1 correct antwoord\n"
-  . "- correctIndex is 0-3\n"
-  . "- category: {$category}\n"
-  . ($excludeQuestion !== "" ? "- Vermijd exact deze vraag: \"{$excludeQuestion}\"\n" : "")
-  . (count($excludedQuestions) > 0
-    ? "- Vermijd exact deze vragen: \"" . implode("\" | \"", $excludedQuestions) . "\"\n"
-    : "")
-  . (count($excludedCategories) > 0
-    ? "- Vermijd deze categorieën: " . implode(", ", $excludedCategories) . "\n"
-    : "")
-  . "Geef JSON met velden: question, answers, correctIndex, category.\n\n"
-  . "Bronnen:\n"
-  . implode("\n", $contextLines);
+$maxAttempts = max(1, (int) ($config["groq_max_attempts"] ?? 3));
+$attempts = 0;
+$questionData = null;
+$questionText = "";
+$answers = [];
+$correctIndex = null;
+$finalCategory = $category;
+$excludedQuestionsPrompt = $excludedQuestionsRaw;
+$excludedQuestionsNormalized = $excludedQuestionsCombined;
+$groqDebug = $debug ? [] : null;
 
-$groqDebug = [];
-try {
-  $questionData = ai_groq_generate_json(
-    $config,
-    $systemPrompt,
-    $userPrompt,
-    0.7,
-    400,
-    $debug ? $groqDebug : null
+while ($attempts < $maxAttempts) {
+  $attempts += 1;
+  $userPrompt = buildUserPrompt(
+    $category,
+    $excludeQuestion,
+    $excludedQuestionsPrompt,
+    $excludedCategories,
+    $contextLines
   );
-} catch (RuntimeException $e) {
-  error_log("Groq error: " . $e->getMessage());
-  if ($e->getCode() === 429) {
-    respond(429, ["error" => "Groq rate limit reached"]);
+
+  $groqDebugAttempt = $debug ? [] : null;
+  try {
+    $questionData = ai_groq_generate_json(
+      $config,
+      $systemPrompt,
+      $userPrompt,
+      0.7,
+      400,
+      $groqDebugAttempt
+    );
+  } catch (RuntimeException $e) {
+    error_log("Groq error: " . $e->getMessage());
+    if ($e->getCode() === 429) {
+      respond(429, ["error" => "Groq rate limit reached"]);
+    }
+    $payload = ["error" => $e->getMessage()];
+    if ($debug) {
+      $payload["groq_status"] = $groqDebugAttempt["status"] ?? null;
+      $payload["groq_error"] = $groqDebugAttempt["error"] ?? null;
+      $payload["groq_body"] = $groqDebugAttempt["body"] ?? "";
+      $payload["groq_text"] = $groqDebugAttempt["text"] ?? "";
+    }
+    respond(502, $payload);
   }
-  $payload = ["error" => $e->getMessage()];
-  if ($debug) {
-    $payload["groq_status"] = $groqDebug["status"] ?? null;
-    $payload["groq_error"] = $groqDebug["error"] ?? null;
-    $payload["groq_body"] = $groqDebug["body"] ?? "";
-    $payload["groq_text"] = $groqDebug["text"] ?? "";
+
+  $questionText = $questionData["question"] ?? "";
+  $answers = $questionData["answers"] ?? [];
+  $correctIndex = $questionData["correctIndex"] ?? null;
+  $finalCategory = $questionData["category"] ?? $category;
+
+  if (
+    $questionText === "" ||
+    !is_array($answers) ||
+    count($answers) !== 4 ||
+    !is_int($correctIndex) ||
+    $correctIndex < 0 ||
+    $correctIndex > 3
+  ) {
+    respond(502, ["error" => "LLM returned invalid question structure"]);
   }
-  respond(502, $payload);
+
+  if (isQuestionExcluded($questionText, $excludedQuestionsNormalized)) {
+    $excludedQuestionsPrompt[] = $questionText;
+    $excludedQuestionsPrompt = array_values(array_unique($excludedQuestionsPrompt));
+    $excludedQuestionsNormalized[] = normalizeText($questionText);
+    $excludedQuestionsNormalized = array_values(array_unique($excludedQuestionsNormalized));
+
+    if ($attempts >= $maxAttempts) {
+      $payload = ["error" => "LLM returned duplicate question"];
+      if ($debug) {
+        $payload["groq_status"] = $groqDebugAttempt["status"] ?? null;
+        $payload["groq_error"] = $groqDebugAttempt["error"] ?? null;
+        $payload["groq_body"] = $groqDebugAttempt["body"] ?? "";
+        $payload["groq_text"] = $groqDebugAttempt["text"] ?? "";
+        $payload["attempts"] = $attempts;
+      }
+      respond(409, $payload);
+    }
+    continue;
+  }
+
+  $groqDebug = $groqDebugAttempt;
+  break;
 }
 
-$questionText = $questionData["question"] ?? "";
-$answers = $questionData["answers"] ?? [];
-$correctIndex = $questionData["correctIndex"] ?? null;
-$finalCategory = $questionData["category"] ?? $category;
-
-if (
-  $questionText === "" ||
-  !is_array($answers) ||
-  count($answers) !== 4 ||
-  !is_int($correctIndex) ||
-  $correctIndex < 0 ||
-  $correctIndex > 3
-) {
-  respond(502, ["error" => "LLM returned invalid question structure"]);
+if ($questionData === null) {
+  respond(502, ["error" => "LLM did not return a question"]);
 }
 
 $id = $questionData["id"] ?? ("ai-live-" . bin2hex(random_bytes(4)));
@@ -379,6 +574,18 @@ $response = [
   "origin" => "live",
 ];
 
+if ($historyMax > 0) {
+  $historyItems[] = [
+    "question" => $questionText,
+    "category" => $finalCategory,
+    "cachedAt" => date("c"),
+  ];
+  if (count($historyItems) > $historyMax) {
+    $historyItems = array_slice($historyItems, -$historyMax);
+  }
+  saveQuestionHistory($historyPath, $historyItems);
+}
+
 if ($cacheMax > 0) {
   $cacheItems[] = array_merge($response, ["cachedAt" => date("c")]);
   if (count($cacheItems) > $cacheMax) {
@@ -388,3 +595,4 @@ if ($cacheMax > 0) {
 }
 
 respond(200, $response);
+

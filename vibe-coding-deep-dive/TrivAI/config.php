@@ -51,4 +51,6 @@ return [
   "groq_timeout" => (int) (getenv("GROQ_TIMEOUT") ?: 20),
   "cache_ttl" => (int) (getenv("CACHE_TTL") ?: 900),
   "cache_max" => (int) (getenv("CACHE_MAX") ?: 50),
+  "history_ttl" => (int) (getenv("HISTORY_TTL") ?: 0),
+  "history_max" => (int) (getenv("HISTORY_MAX") ?: 500),
 ];
